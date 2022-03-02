@@ -1,0 +1,1 @@
+nohup python -m torch.distributed.launch --nproc_per_node 4 --master_port 9527 train.py --batch-size 16 --img 1280 1280 --data data/voc.yaml --cfg cfg/yolor_p6.cfg --weights 'checkpoints/yolor_p6_coco.pt' --device 4,5,6,7 --sync-bn --name yolor_p6_voc_train --hyp hyp.finetune.yaml --epochs 50 > voc_train_smaller_lr.log &
