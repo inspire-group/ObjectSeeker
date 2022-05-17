@@ -33,8 +33,7 @@ def clean_eval(args):
 	CLEAN_DIR = args.clean_dir
 	CLEAN_DIR = os.path.join(CLEAN_DIR,dataset_name)
 	match_class = 'cls' if args.match_class else 'nocls'
-	CLEAN_DIR = os.path.join(CLEAN_DIR,'{}_{}_{}_{}_{}_{}'.format(model_name,args.num_line,args.ioa_prune_thres,args.iou_prune_thres,match_class,args.pruning_mode))
-
+	CLEAN_DIR = os.path.join(CLEAN_DIR,'{}_{}_{}_{}_{}_{}_{}_{}_{}_{}'.format(model_name,args.num_line,args.ioa_prune_thres,args.nonoverlap_iou_prune_thres,args.overlap_iou_prune_thres,args.overlap_ioa_min,args.overlap_ioa_max,args.overlap_conf_diff,match_class,args.pruning_mode))
 
 	conf_thres_list = np.linspace(0,0.99,100)[::-1] if not args.single else [args.base_conf_thres]
 
@@ -146,10 +145,18 @@ if __name__ == '__main__':
 	parser.add_argument('--masked-conf-thres', type=float, default=0.8, help='conf thres for masked predictions ($tau_mask$)')
 	parser.add_argument('--pruning-mode', type=str, default='ioa', help='ioa or iou')
 	parser.add_argument('--ioa-prune-thres', type=float, default=0.6, help='ioa threshold for box filtering/pruning ($tau_ioa$)')
-	parser.add_argument('--iou-prune-thres', type=float, default=0.8, help='iou threshold for box filtering/pruning ($tau_iou$; not used in the main body; see appendix)')
+	#parser.add_argument('--iou-prune-thres', type=float, default=0.8, help='iou threshold for box filtering/pruning ($tau_iou$; not used in the main body; see appendix)')
 	parser.add_argument('--match-class', action='store_true', help='whether consider class label in the pruning (will affect robustness property)')
 	parser.add_argument('--alpha', type=float, default=0.8, help='minimum masked confidence threshold (used for clean AP calculation; see appendix)')
 	parser.add_argument('--beta', type=float, default=0.5, help='(used for clean AP calculation; see appendix)')
+
+	# new args for IoU all locations (remove iou-prune-thres)
+	parser.add_argument('--overlap-conf-diff', type=float, default = 0.8, help='how much to inflate the confidence scores of overlapping boxes')
+	parser.add_argument('--nonoverlap-iou-prune-thres', type=float, default=0.8, help ='iou nms threshold for nonoverlapping boxes')
+	parser.add_argument('--overlap-iou-prune-thres', type=float, default=0.6, help ='iou nms threshold for overlapping boxes')
+	parser.add_argument('--overlap-ioa-min', type=float, default=0.0, help='box sifting lower bound; removes any overlapping box with less than this amount of overlap with the mask')
+	parser.add_argument('--overlap-ioa-max', type=float, default=1.0, help='box sifting upper bound; removes any overlapping box with more than this amount of overlap with the mask')
+
 
 	# functional arguments
 	parser.add_argument("--save",action='store_true',help='save the evaluation results (for further analysis)')

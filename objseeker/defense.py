@@ -142,9 +142,15 @@ class ObjSeekerModel(object):
         # box pruning parameters
         self.pruning_mode = args.pruning_mode # 'ioa' or 'iou'
         self.ioa_prune_thres = args.ioa_prune_thres # discard masked prediction boxes whose ioa with base prediction box exceeds this threshold
-        self.iou_prune_thres = args.iou_prune_thres # nonoverlap box nms pruning (when args.pruning_mode=='iou')
+        #self.iou_prune_thres = args.iou_prune_thres # nonoverlap box nms pruning (when args.pruning_mode=='iou')
         self.dbscan = DBSCAN(eps=0.1, min_samples=1,metric='precomputed') #dbscan instance for overlap boxes pruning
         self.match_class = args.match_class # whether consider class labels
+
+        self.overlap_conf_diff = args.overlap_conf_diff
+        self.nonoverlap_iou_prune_thres = args.nonoverlap_iou_prune_thres # nonoverlap box nms merging (when args.iou==True)
+        self.overlap_iou_prune_thres = args.overlap_iou_prune_thres
+        self.overlap_ioa_min = args.overlap_ioa_min
+        self.overlap_ioa_max = args.overlap_ioa_max
 
         #misc
         self.device = args.device
@@ -372,7 +378,7 @@ class ObjSeekerModel(object):
 
         obj_cnt = 0 
         far_vul_cnt,close_vul_cnt,over_vul_cnt = 0,0,0
-        far_vul_cnt_iou = 0
+        far_vul_cnt_iou,close_vul_cnt_iou,over_vul_cnt_iou = 0,0,0
         for img_i in range(num_img): # for each image
             # get masked prediction       
             raw_masked_dict = raw_masked_output_precomputed[img_i]
@@ -479,7 +485,9 @@ class ObjSeekerModel(object):
             over_vul_cnt+=vul_count_ioa.item()
 
         far_vul_cnt_iou = obj_cnt
-        return far_vul_cnt_iou,far_vul_cnt,close_vul_cnt,over_vul_cnt,obj_cnt
+        close_vul_cnt_iou = obj_cnt
+        over_vul_cnt_iou = obj_cnt
+        return far_vul_cnt_iou,close_vul_cnt_iou,over_vul_cnt_iou,far_vul_cnt,close_vul_cnt,over_vul_cnt,obj_cnt
 
     def ioa_certify_flg(self, box1, box2, certify_ioa_thres):
 
@@ -524,7 +532,8 @@ class ObjSeekerModel(object):
 #############################################################################################################################################################                
     #below are for iou inference and iou certification (discussed in the appendix)
 
-    def iou_inference(self,img,base_output_precomputed=None,raw_masked_output_precomputed=None,save_dir=None,paths=None,names=None,scale_factor=None):
+    # original appendix code
+    def iou_inference_appendix(self,img,base_output_precomputed=None,raw_masked_output_precomputed=None,save_dir=None,paths=None,names=None,scale_factor=None):
         # the same usage as __call__()
 
         # setup
@@ -617,6 +626,122 @@ class ObjSeekerModel(object):
             defense_output[img_i] = torch.cat([overlap_boxes,nonoverlap_output[img_i]])
 
         return defense_output
+    
+    def iou_inference(self,img,base_output_precomputed=None,raw_masked_output_precomputed=None,save_dir=None,paths=None,names=None,scale_factor=None):
+        # the same usage as __call__()
+
+        # setup
+        if isinstance(img,torch.Tensor): #yolo input is tensor
+            num_img,_,height,width = img.shape
+        else: # the input for mmdet is not torch.Tensor
+            num_img,_,height,width = img['img'][0].shape
+        # get coordinates of partition points
+        idx_list = self.get_mask_idx(height,width)
+        # for each image, get filtered masked predictions
+        defense_output = [torch.zeros((0,6)).to(self.device) for i in range(num_img)] # to hold the final output 
+        #defense_output = [None for i in range(num_img)] # final output
+        
+        nonoverlap_output = [[] for i in range(num_img)] # a list for nonoverlapping boxes
+        overlap_output = [[] for i in range(num_img)] # a list of overlapping boxes
+
+        # next, we are going to gather all nonoverlap_output and overlap_output
+        for idx_i, (x,y) in enumerate(idx_list): # for each partition point
+            mask_list = self.gen_mask(x,y,height,width) if raw_masked_output_precomputed is None or self.debug == True else list(range(4))
+            
+            for mask_i,mask in enumerate(mask_list): # for each mask (4 masks in total)
+                if raw_masked_output_precomputed is None: # no precomputed detections. do detection now!
+                    masked_output_ = self.base_model(img,mask=mask,conf_thres=self.masked_conf_thres)#,nms_iou_thres=self.base_nms_iou_thres)  # each is xyxy conf cls 
+                
+                for img_i in range(num_img): # for each image
+                    if raw_masked_output_precomputed is None: # get masked boxes for this image, depending on if precomputed detection is available
+                        masked_boxes = masked_output_[img_i]
+                    else:
+                        masked_boxes = raw_masked_output_precomputed[img_i][(x,y)][mask_i].to(self.device)
+                        # comment this line since we need to apply confidence score inflation to overlapping boxes
+                        #masked_boxes = masked_boxes[masked_boxes[:,4]>self.masked_conf_thres]
+
+                    if scale_factor is not None:
+                        masked_boxes[:,:4] = masked_boxes[:,:4]*scale_factor
+
+                    # divide masked_boxes to nonoverlap_boxes and overlap_boxes
+                    nonoverlap_boxes,overlap_boxes = self.split_overlap_boxes(masked_boxes,x,y,height,width,mask_i,offset=0.01)
+
+                    mask_box = self.gen_mask_box(x, y, height, width, mask_i)
+                    # box sifting
+                    if overlap_boxes.size(0) > 0:
+                        overlap_ioa = torch.squeeze(self.box_ioa(overlap_boxes[:,:4], mask_box.unsqueeze(0)), dim=1)
+                        overlap_boxes = overlap_boxes[torch.logical_and(overlap_ioa > self.overlap_ioa_min, overlap_ioa < self.overlap_ioa_max)]
+
+                    # artificially inflate overlapping box confidence scores
+                    overlap_boxes[:,4] = torch.maximum(torch.minimum(overlap_boxes[:,4]+self.overlap_conf_diff, torch.tensor(0.95, device=overlap_boxes.device)), overlap_boxes[:,4])
+                    overlap_boxes = overlap_boxes[overlap_boxes[:,4]>self.masked_conf_thres]
+                    nonoverlap_boxes = nonoverlap_boxes[nonoverlap_boxes[:,4]>self.masked_conf_thres]
+
+                    # if len(overlap_boxes) > 0 and self.debug:
+                    #     # print(f'{self.pic_cnt+img_i}_{idx_i}_{mask_i}')
+                    #     # print(overlap_boxes)
+                    #     # print()
+                    #     d = f'overlap_output/{self.model_name}'
+                    #     os.makedirs(d, exist_ok=True)
+                    #     plot_images(img[img_i]*mask, output_to_target([overlap_boxes], width, height), fname=f'{d}/{self.pic_cnt+img_i}_{idx_i}_{mask_i}.jpg', names=self.VOC_NAMES)
+                    
+                    # if len(nonoverlap_boxes) > 0 and self.debug:
+                    #     d = f'nonoverlap_output/{self.model_name}'
+                    #     os.makedirs(d, exist_ok=True)
+                    #     plot_images(img[img_i]*mask, output_to_target([nonoverlap_boxes], width, height), fname=f'{d}/{self.pic_cnt+img_i}_{idx_i}_{mask_i}.jpg', names=self.VOC_NAMES)
+
+                    nonoverlap_output[img_i].append(nonoverlap_boxes)
+                    overlap_output[img_i].append(overlap_boxes)
+
+        #self.pic_cnt += num_img
+        if base_output_precomputed is None:
+            base_output_precomputed = self.base_model(img,conf_thres=self.base_conf_thres)#,nms_iou_thres=self.base_nms_iou_thres)
+        
+        base_output = [pred[pred[:,4]>self.base_conf_thres].to(self.device) for pred in base_output_precomputed] # each is xyxy conf cls # used as part of the output
+
+        # if len(base_output) > 0 and self.debug:
+        #     d = f'base_output/{self.model_name}'
+        #     os.makedirs(d, exist_ok=True)
+        #     plot_images(img, output_to_target(base_output, width, height), fname=f'{d}/{self.pic_cnt}.jpg', names=self.VOC_NAMES)
+
+        if scale_factor is not None:
+            for i in range(len(base_output)):
+                base_output[i][:,:4] = base_output[i][:,:4]*scale_factor
+
+        # first deal with nonoverlap boxes
+        # in this implementation, we made some simplifications and directly apply NMS on masked and base boxes.
+        for img_i in range(num_img): # for each image
+            nonoverlap_masked_boxes = nonoverlap_output[img_i]
+            
+            if len(nonoverlap_masked_boxes)>0 or len(base_output[img_i])>0: # there is at least one box 
+                nonoverlap_boxes = torch.cat(nonoverlap_masked_boxes+[base_output[img_i]]) # combine base boxes and nonoverlapping boxes 
+                clip_coords(nonoverlap_boxes, (height, width)) # clip negative values
+                # perform nms
+                c = nonoverlap_boxes[:, 5:6] * 4096  # classes
+                boxes, scores = nonoverlap_boxes[:, :4] + c, nonoverlap_boxes[:, 4]  # boxes (offset by class), scores
+                keep = torchvision.ops.nms(boxes,scores,self.nonoverlap_nms_iou_thres) 
+                nonoverlap_output[img_i] = nonoverlap_boxes[keep]
+
+            if len(overlap_output[img_i]) > 0:
+                overlap_boxes = torch.cat(overlap_output[img_i])
+                num_overlap_boxes = overlap_boxes.size(0)
+                overlap_boxes = torch.cat([overlap_boxes, nonoverlap_output[img_i]]) # combine overlapping boxes with filtered base/nonoverlapping boxes
+
+                # set confidence score of non-overlapping boxes to 1.0 so they can't be removed by NMS!
+                scores = torch.ones(overlap_boxes.size(0), device=overlap_boxes.device)
+                scores[:num_overlap_boxes] = overlap_boxes[:num_overlap_boxes, 4]
+
+                clip_coords(overlap_boxes, (height, width))
+                c = overlap_boxes[:,5:6] * 4096
+                boxes = overlap_boxes[:, :4] + c # boxes (offset by class)
+                keep = torchvision.ops.nms(boxes,scores,self.overlap_nms_iou_thres) 
+
+                # only keep overlapping boxes
+                overlap_output[img_i] = overlap_boxes[keep[keep<num_overlap_boxes]]
+
+            defense_output[img_i] = torch.cat([overlap_output[img_i],nonoverlap_output[img_i]])
+
+        return defense_output
 
     def split_overlap_boxes(self,boxes,ii,jj,height,width,mask_i,offset=0.05):
         #divide boxes into overlap and nonoverlap boxes
@@ -644,7 +769,8 @@ class ObjSeekerModel(object):
         overlap = check_mask_overlap(boxes,ii,jj,height,width,mask_i,offset)
         return boxes[~overlap],boxes[overlap]
     
-    def iou_certify(self,img,raw_masked_output_precomputed,ground_truth,patch_size,certify_iou_thres,certify_ioa_thres,save_dir=None,paths=None,scale_factor=None):
+    # original appendix code
+    def iou_certify_appendix(self,img,raw_masked_output_precomputed,ground_truth,patch_size,certify_iou_thres,certify_ioa_thres,save_dir=None,paths=None,scale_factor=None):
         # the same usage as certify()
         ioa=True
         iou=True
@@ -793,6 +919,205 @@ class ObjSeekerModel(object):
                 over_vul_cnt+=vul_count_ioa.item()
             
         return far_vul_cnt_iou,far_vul_cnt,close_vul_cnt,over_vul_cnt,obj_cnt
+
+    def iou_certify(self,img,raw_masked_output_precomputed,ground_truth,patch_size,certify_iou_thres,certify_ioa_thres,save_dir=None,paths=None,scale_factor=None):
+        # the same usage as certify()
+        ioa=True
+        iou=True
+        if isinstance(img,torch.Tensor):
+            num_img,_,height,width = img.shape
+        else: # the input for mmdet is not torch.Tensor
+            num_img,_,height,width = img['img'][0].shape
+        aspect_ratio = 1#8#1#8.# for different patch shapes...
+        patch_size = (height*width*patch_size/aspect_ratio)**0.5 # patch_size % of image pixel
+
+        patch_size_x = int(patch_size)
+        patch_size_y = int(patch_size * aspect_ratio)
+        #print(patch_size_x,patch_size_y,aspect_ratio,height,width)
+
+        obj_cnt = 0 
+        far_vul_cnt,close_vul_cnt,over_vul_cnt = 0,0,0
+        far_vul_cnt_iou,close_vul_cnt_iou,over_vul_cnt_iou = 0,0,0
+        for img_i in range(num_img): # for each image
+            # get masked prediction       
+            raw_masked_dict = raw_masked_output_precomputed[img_i]
+            labels = ground_truth[img_i].to(self.device) # ground truth labels for this image
+            tbox = labels[:,:4]
+            
+            num_boxes = len(labels)
+            obj_cnt += num_boxes
+            
+            # a binary map indicating our defense is robust to adversarial pixels at each pixel locations
+            # one for ioa robustness, another for iou robustness
+            # note that we have one slice of robustness map (shape [height,width]) for every box and every mask
+            if ioa:
+                robust_bitmap_ioa = torch.zeros((num_boxes,4,height,width)).to(self.device)
+            if iou:
+                robust_bitmap_iou = torch.zeros((num_boxes,4,height,width)).to(self.device)
+
+            for (x,y) in raw_masked_dict.keys():
+                masked_boxes_list = raw_masked_dict[(x,y)] # a list for four masked predictions
+                for mask_i,masked_boxes in enumerate(masked_boxes_list):
+
+                    if masked_boxes is None or len(masked_boxes)==0:
+                        continue
+
+                    # artificially inflate overlap box confidence scores                    
+                    nonoverlap_boxes,overlap_boxes = self.split_overlap_boxes(masked_boxes,x,y,height,width,mask_i,offset=0.01)
+                    overlap_boxes[:,4] = torch.maximum(torch.minimum(overlap_boxes[:,4]+self.overlap_conf_diff, torch.tensor(0.95, device=overlap_boxes.device)), overlap_boxes[:,4])
+                    masked_boxes = torch.cat((nonoverlap_boxes, overlap_boxes))
+
+                    masked_boxes = masked_boxes[masked_boxes[:,4]>self.masked_conf_thres]
+                    if len(masked_boxes)==0:
+                        continue
+                    masked_boxes = masked_boxes.to(self.device)
+                    clip_coords(masked_boxes, (height, width))
+
+                    if scale_factor is not None:
+                        masked_boxes[:,:4] = masked_boxes[:,:4]*scale_factor
+
+
+                    nonoverlap_boxes,overlap_boxes = self.split_overlap_boxes(masked_boxes,x,y,height,width,mask_i,offset=0.01)
+                                       
+                    mask_box = self.gen_mask_box(x, y, height, width, mask_i)
+
+                    # box sifting
+                    if overlap_boxes.size(0) > 0:
+                        overlap_ioa = torch.squeeze(self.box_ioa(overlap_boxes[:,:4], mask_box.unsqueeze(0)), dim=1)
+                        overlap_boxes = overlap_boxes[torch.logical_and(overlap_ioa > self.overlap_ioa_min, overlap_ioa < self.overlap_ioa_max)]
+                    if self.match_class: # add class offets
+                        gt_boxes = tbox + labels[:, 4:5] * 4096
+                        nonoverlap_boxes = nonoverlap_boxes[:,:4] + nonoverlap_boxes[:, 5:6] * 4096
+                        overlap_boxes = overlap_boxes[:,:4] + overlap_boxes[:, 5:6] * 4096
+                    else:
+                        gt_boxes = tbox 
+                        nonoverlap_boxes = nonoverlap_boxes[:,:4] 
+                        overlap_boxes = overlap_boxes[:,:4] 
+
+                    # use nonoverlapping boxes for certification (it can certify iou and ioa robustness)
+                    #if iou:
+                    nonoverlap_flag_iou,nonoverlap_flag_ioa = self.iou_ioa_certify_flg(gt_boxes, nonoverlap_boxes, certify_iou_thres=certify_iou_thres,certify_ioa_thres=certify_ioa_thres)
+                    overlap_flag_iou, overlap_flag_ioa = self.iou_ioa_certify_flg(gt_boxes, overlap_boxes, certify_iou_thres=certify_iou_thres, certify_ioa_thres=certify_ioa_thres, overlap=True)
+                    
+                    # use overlapping boxes for certification (it can only certify ioa robustness)
+                    # if ioa:
+                    #     overlap_flag_ioa = self.ioa_certify_flg(gt_boxes, overlap_boxes,certify_ioa_thres=certify_ioa_thres)
+                    
+                    #update each robustness map based on the certification results at this particular mask location
+                    if ioa:
+                        self.update_map(robust_bitmap_ioa,torch.logical_or(nonoverlap_flag_ioa,overlap_flag_ioa),x,y,mask_i)
+                    if iou:
+                        self.update_map(robust_bitmap_iou,torch.logical_or(nonoverlap_flag_iou, overlap_flag_iou),x,y,mask_i)
+
+            # with robust_bitmap_ioa and robust_bitmap_iou generated, now we can determine the certified recall
+
+            offset = 0.1 # the offset to distinguish between a close-patch and far-patch
+            x_offset = height*offset
+            y_offset = width*offset
+            if ioa:
+                robust_bitmap_ioa = torch.nn.functional.pad(robust_bitmap_ioa, pad=(patch_size_y,patch_size_y,patch_size_x,patch_size_x), mode='constant', value=1.0)
+            if iou:
+                robust_bitmap_iou = torch.nn.functional.pad(robust_bitmap_iou, pad=(patch_size_y,patch_size_y,patch_size_x,patch_size_x), mode='constant', value=1.0)
+
+            # use a sliding window (i.e., a patch) over the -robust_bitmap_iou. 
+            # The output is zero if at least one of the pixel location within the sliding windowhas zero
+            # note the max pooling with a stride of 1 is memory-consuming
+            if iou:
+                vulnerable_map_iou = torch.nn.functional.max_pool2d(-robust_bitmap_iou,kernel_size=(patch_size_x,patch_size_y), stride=1,padding = 0)
+                vulnerable_map_iou = torch.sum(vulnerable_map_iou,dim=1)==0 # the defense is vulnerable if all four mask robustness map give an output of zero
+            if ioa:
+                vulnerable_map_ioa = torch.nn.functional.max_pool2d(-robust_bitmap_ioa,kernel_size=(patch_size_x,patch_size_y), stride=1,padding = 0)
+                vulnerable_map_ioa = torch.sum(vulnerable_map_ioa,dim=1)==0
+            
+            # use logical_and. our defense is vulnerable when there is a location such that, 1) the location is vulnerable 2) the location is a valid one
+            if iou:
+                
+                #location map. valid patch locations are ones; others are zeros
+                location_map = torch.ones_like(vulnerable_map_iou,dtype=torch.bool).to(self.device)
+                # far patch
+                for box_i,box in enumerate(tbox):
+                    box = box.type(torch.int)
+                    #a,b = int(max(0,box[1]-patch_size-x_offset)),int(min(box[3]+1 + x_offset,location_map.shape[1]))
+                    #c,d = int(max(0,box[0]-patch_size-y_offset)),int(min(box[2]+1 + y_offset,location_map.shape[2]))
+                    a,b = int(max(0,box[1]-x_offset)),int(min(box[3]+1 + x_offset + patch_size_x,location_map.shape[1]))
+                    c,d = int(max(0,box[0]-y_offset)),int(min(box[2]+1 + y_offset + patch_size_y ,location_map.shape[2]))
+                    location_map[box_i,a:b,c:d] = False
+
+                vul_count_iou = torch.any(torch.any(torch.logical_and(location_map,vulnerable_map_iou),dim=-1),dim=-1)
+                vul_count_iou = torch.sum(vul_count_iou)
+                far_vul_cnt_iou+=vul_count_iou.item()
+
+                # close patch
+                for box_i,box in enumerate(tbox):
+                    box = box.type(torch.int)
+                    #a,b = max(0,box[1]-patch_size),min(box[3]+1,location_map.shape[1])
+                    #c,d = max(0,box[0]-patch_size),min(box[2]+1,location_map.shape[2])
+                    a,b = max(0,box[1]),min(box[3]+1+patch_size_x,location_map.shape[1])
+                    c,d = max(0,box[0]),min(box[2]+1+patch_size_y,location_map.shape[2])
+                    location_map[box_i,a:b,c:d] = True 
+                location_map = ~location_map
+                vul_count_iou = torch.any(torch.any(torch.logical_and(location_map,vulnerable_map_iou),dim=-1),dim=-1)
+                vul_count_iou = torch.sum(vul_count_iou)
+                close_vul_cnt_iou+=vul_count_iou.item()
+
+                # over patch
+                location_map = torch.zeros_like(location_map,dtype=torch.bool).to(self.device)
+                for box_i,box in enumerate(tbox):
+                    box = box.type(torch.int)
+                    #a,b = max(0,box[1]-patch_size),min(box[3]+1,location_map.shape[1])
+                    #c,d = max(0,box[0]-patch_size),min(box[2]+1,location_map.shape[2])
+                    a,b = max(0,box[1]),min(box[3]+1+patch_size_x,location_map.shape[1])
+                    c,d = max(0,box[0]),min(box[2]+1+patch_size_y,location_map.shape[2])
+                    location_map[box_i,a:b,c:d] = True 
+                vul_count_iou = torch.any(torch.any(torch.logical_and(location_map,vulnerable_map_iou),dim=-1),dim=-1)
+                vul_count_iou = torch.sum(vul_count_iou)
+                over_vul_cnt_iou+=vul_count_iou.item()
+            
+            
+            if ioa:
+
+                #location map. valid patch locations are ones; others are zeros
+                location_map = torch.ones_like(vulnerable_map_ioa,dtype=torch.bool).to(self.device)
+                # far patch
+                for box_i,box in enumerate(tbox):
+                    box = box.type(torch.int)
+                    #a,b = int(max(0,box[1]-patch_size-x_offset)),int(min(box[3]+1 + x_offset,location_map.shape[1]))
+                    #c,d = int(max(0,box[0]-patch_size-y_offset)),int(min(box[2]+1 + y_offset,location_map.shape[2]))
+                    a,b = int(max(0,box[1]-x_offset)),int(min(box[3]+1 + x_offset + patch_size_x,location_map.shape[1]))
+                    c,d = int(max(0,box[0]-y_offset)),int(min(box[2]+1 + y_offset + patch_size_y ,location_map.shape[2]))
+                    location_map[box_i,a:b,c:d] = False
+            
+                vul_count_ioa = torch.any(torch.any(torch.logical_and(location_map,vulnerable_map_ioa),dim=-1),dim=-1)
+                vul_count_ioa = torch.sum(vul_count_ioa)
+                far_vul_cnt+=vul_count_ioa.item()
+                
+                # close patch
+                for box_i,box in enumerate(tbox):
+                    box = box.type(torch.int)
+                    #a,b = max(0,box[1]-patch_size),min(box[3]+1,location_map.shape[1])
+                    #c,d = max(0,box[0]-patch_size),min(box[2]+1,location_map.shape[2])
+                    a,b = max(0,box[1]),min(box[3]+1+patch_size_x,location_map.shape[1])
+                    c,d = max(0,box[0]),min(box[2]+1+patch_size_y,location_map.shape[2])
+                    location_map[box_i,a:b,c:d] = True 
+                location_map = ~location_map
+                vul_count_ioa = torch.any(torch.any(torch.logical_and(location_map,vulnerable_map_ioa),dim=-1),dim=-1)
+                vul_count_ioa = torch.sum(vul_count_ioa)
+                close_vul_cnt+=vul_count_ioa.item()
+
+                # over patch
+                location_map = torch.zeros_like(location_map,dtype=torch.bool).to(self.device)
+                for box_i,box in enumerate(tbox):
+                    box = box.type(torch.int)
+                    #a,b = max(0,box[1]-patch_size),min(box[3]+1,location_map.shape[1])
+                    #c,d = max(0,box[0]-patch_size),min(box[2]+1,location_map.shape[2])
+                    a,b = max(0,box[1]),min(box[3]+1+patch_size_x,location_map.shape[1])
+                    c,d = max(0,box[0]),min(box[2]+1+patch_size_y,location_map.shape[2])
+                    location_map[box_i,a:b,c:d] = True 
+                vul_count_ioa = torch.any(torch.any(torch.logical_and(location_map,vulnerable_map_ioa),dim=-1),dim=-1)
+                vul_count_ioa = torch.sum(vul_count_ioa)
+                over_vul_cnt+=vul_count_ioa.item()
+            
+        return far_vul_cnt_iou,close_vul_cnt_iou,over_vul_cnt_iou,far_vul_cnt,close_vul_cnt,over_vul_cnt,obj_cnt
 
     def iou_ioa_certify_flg(self, box1, box2, certify_iou_thres,certify_ioa_thres):
         # the nonoverlapping boxes can be used for ioa and iou certification

@@ -114,11 +114,18 @@ def parse_args():
     parser.add_argument('--masked-conf-thres', type=float, default=0.8, help='conf thres for masked predictions ($tau_mask$)')
     parser.add_argument('--pruning-mode', type=str, default='ioa', help='ioa or iou')
     parser.add_argument('--ioa-prune-thres', type=float, default=0.6, help='ioa threshold for box filtering/pruning ($tau_ioa$)')
-    parser.add_argument('--iou-prune-thres', type=float, default=0.8, help='iou threshold for box filtering/pruning ($tau_iou$; not used in the main body; see appendix)')
+    #parser.add_argument('--iou-prune-thres', type=float, default=0.8, help='iou threshold for box filtering/pruning ($tau_iou$; not used in the main body; see appendix)')
     parser.add_argument('--match-class', action='store_true', help='whether consider class label in the pruning (will affect robustness property)')
     parser.add_argument('--alpha', type=float, default=0.8, help='minimum masked confidence threshold (used for clean AP calculation; see appendix)')
     parser.add_argument('--beta', type=float, default=0.5, help='(used for clean AP calculation; see appendix)')
-        
+
+    # new args for IoU all locations (remove iou-prune-thres)
+    parser.add_argument('--overlap-conf-diff', type=float, default = 0.8, help='how much to inflate the confidence scores of overlapping boxes')
+    parser.add_argument('--nonoverlap-iou-prune-thres', type=float, default=0.8, help ='iou nms threshold for nonoverlapping boxes')
+    parser.add_argument('--overlap-iou-prune-thres', type=float, default=0.6, help ='iou nms threshold for overlapping boxes')
+    parser.add_argument('--overlap-ioa-min', type=float, default=0.0, help='box sifting lower bound; removes any overlapping box with less than this amount of overlap with the mask')
+    parser.add_argument('--overlap-ioa-max', type=float, default=1.0, help='box sifting upper bound; removes any overlapping box with more than this amount of overlap with the mask')
+ 
     # certification arguments
     parser.add_argument('--certify-iou-thres', type=float, default=0.0, help='iou thres for robustness certification')
     parser.add_argument('--certify-ioa-thres', type=float, default=0.5, help='ioa thres for robustness certification')
@@ -300,7 +307,7 @@ def main():
     if args.load_raw:
         model_ = None
     if args.certify:
-        cr_res = [0,0,0,0,0]#far_vul_cnt_iou_total,far_vul_cnt_total,close_vul_cnt_total,over_vul_cnt_total,obj_cnt_total
+        cr_res = [0,0,0,0,0,0,0]#far_vul_cnt_iou_total,far_vul_cnt_total,close_vul_cnt_total,over_vul_cnt_total,obj_cnt_total
 
     if args.map:
         conf_thres_list = np.linspace(0,0.99,100)[::-1]
@@ -317,7 +324,7 @@ def main():
         if not os.path.exists(CLEAN_DIR):
             os.mkdir(CLEAN_DIR)
         match_class = 'cls' if args.match_class else 'nocls'
-        CLEAN_DIR = os.path.join(CLEAN_DIR,'{}_{}_{}_{}_{}_{}'.format(model_name,args.num_line,args.ioa_prune_thres,args.iou_prune_thres,match_class,args.pruning_mode))
+        CLEAN_DIR = os.path.join(CLEAN_DIR,'{}_{}_{}_{}_{}_{}_{}_{}_{}_{}'.format(model_name,args.num_line,args.ioa_prune_thres,args.nonoverlap_iou_prune_thres,args.overlap_iou_prune_thres,args.overlap_ioa_min,args.overlap_ioa_max,args.overlap_conf_diff,match_class,args.pruning_mode))
         
         if not os.path.exists(CLEAN_DIR):
             os.mkdir(CLEAN_DIR)
@@ -383,7 +390,7 @@ def main():
                 ground_truth = [torch.cat([bboxes*scale_factor,labels[:,None]],dim=1)]#xyxy cls
 
                 res = model.certify(data,raw_masked_output,ground_truth,args.patch_size,args.certify_iou_thres,args.certify_ioa_thres)
-                cr_res = [cr_res[x]+res[x] for x in range(5)]
+                cr_res = [cr_res[x]+res[x] for x in range(7)]
 
         rank, _ = get_dist_info()
         if rank == 0:
@@ -395,19 +402,19 @@ def main():
         joblib.dump(base_output_list,os.path.join(DUMP_DIR_BASE,'base_output_list.z'))
     if args.certify: # print robustness stats
         obj_cnt_total = cr_res[-1]
-        cr_res = cr_res[:4]
+        cr_res = cr_res[:6]
         cr_res = [100-x/obj_cnt_total*100 for x in cr_res]
         print('Certified recall results:')
-        print('Far-patch (IoU): {:.2f}%; Far-patch (IoA): {:.2f}%; Close-patch (IoA): {:.2f}%; Over-patch (IoA): {:.2f}%'.format(*cr_res))
+        print('Far-patch (IoU): {:.2f}%; Close-patch (IoU): {:.2f}%; Over-patch (IoU): {:.2f}%; Far-patch (IoA): {:.2f}%; Close-patch (IoA): {:.2f}%; Over-patch (IoA): {:.2f}%'.format(*cr_res))
 
         res_dir = 'results_{}'.format(args.pruning_mode)
         match_class = 'cls' if args.match_class else 'nocls'
         if not os.path.exists(res_dir):
             os.mkdir(res_dir)
         if args.pruning_mode == 'ioa':
-            joblib.dump(cr_res,'results_{}/cr_{}_{}_{}_{}_{}_{}_{}_{}.z'.format(args.pruning_mode,dataset_name,model_name,args.num_line,args.masked_conf_thres,args.ioa_prune_thres,args.certify_ioa_thres,args.patch_size,match_class))
+            joblib.dump(cr_res,'results_{}/cr_{}_{}_{}_{}_{}_{}_{}_{}_{}.z'.format(args.pruning_mode,dataset_name,model_name,args.num_line,args.masked_conf_thres,args.ioa_prune_thres,args.certify_ioa_thres,args.patch_size,match_class,args.overlap_conf_diff))
         elif args.pruning_mode == 'iou':
-            joblib.dump(cr_res,'results_{}/cr_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}.z'.format(args.pruning_mode,dataset_name,model_name,args.num_line,args.masked_conf_thres,args.ioa_prune_thres,args.certify_ioa_thres,args.patch_size,match_class,args.iou_prune_thres,args.certify_iou_thres))
+            joblib.dump(cr_res,'results_{}/cr_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}.z'.format(args.pruning_mode,dataset_name,model_name,args.num_line,args.masked_conf_thres,args.ioa_prune_thres,args.certify_ioa_thres,args.patch_size,match_class,args.overlap_conf_diff,args.nonoverlap_iou_prune_thres,args.overlap_iou_prune_thres,args.overlap_ioa_min,args.overlap_ioa_max,args.certify_iou_thres))
     
     if args.save_det:
         print('calling clean_eval.py...')
