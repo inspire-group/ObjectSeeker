@@ -1,11 +1,13 @@
 # ObjectSeeker: Certifiably Robust Object Detection against Patch Hiding Attacks via Patch-agnostic Masking
-By [Chong Xiang](http://xiangchong.xyz/), Alexander Valtchanov, [Saeed Mahloujifar](https://smahloujifar.github.io/), [Prattek Mittal](https://www.princeton.edu/~pmittal/)
+
+By [Chong Xiang](http://xiangchong.xyz/), Alexander Valtchanov, [Saeed Mahloujifar](https://smahloujifar.github.io/), [Prateek Mittal](https://www.princeton.edu/~pmittal/)
 
 Code for "[ObjectSeeker: Certifiably Robust Object Detection against Patch Hiding Attacks via Patch-agnostic Masking](https://arxiv.org/abs/2202.01811)".
 
 #### Check out this [paper list for adversarial patch research](https://github.com/xiangchong1/adv-patch-paper-list) for fun!
 
 ## Files
+
 ```shell
 ├── README.md                        #this file 
 ├── requirement.txt                  #required packages
@@ -32,6 +34,7 @@ Code for "[ObjectSeeker: Certifiably Robust Object Detection against Patch Hidin
     ├── README.md                    #details of checkpoints
     └── ...                          #model checkpoints
 ```
+
 ## Datasets
 
 [YOLOR](https://github.com/WongKinYiu/yolor) is based on [YOLOv5](https://github.com/ultralytics/yolov5), and thus needs pre-processed data from ultralytics. [mmdet](https://github.com/open-mmlab/mmdetection) (swin) uses official datasets directly. 
@@ -47,7 +50,7 @@ Code for "[ObjectSeeker: Certifiably Robust Object Detection against Patch Hidin
   - (yolor) see this [script](https://github.com/ultralytics/yolov5/blob/master/data/scripts/get_coco.sh) for downloading ultralytics-YOLO style COCO dataset.
     - specify the data directory in `yolor/data/coco.yaml`.
 
-## Dependency 
+## Dependency
 
 - PyTorch
   - follow the [official website](https://pytorch.org/get-started/locally/) to install PyTorch.
@@ -57,6 +60,7 @@ Code for "[ObjectSeeker: Certifiably Robust Object Detection against Patch Hidin
   - see [`requirement.txt`](requirement.txt); install via `pip install -r requirement.txt`. 
 
 ## Usage
+
 - See **Files** for details of each file. 
 - Setup the datasets and dependency as discussed above. 
 - Download checkpoints from this Google Drive [link](https://drive.google.com/drive/folders/1kf4O42nohcQYfU9brDK3E-8_mGHPyCQW?usp=sharing) and move them to `checkpoints/`.
@@ -76,6 +80,3 @@ If you find our work useful in your research, please consider citing:
   year={2022}
 }
 ```
-
-
-
